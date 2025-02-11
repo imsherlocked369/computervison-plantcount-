@@ -1,0 +1,110 @@
+import os
+import zipfile
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D
+from tensorflow.keras.models import Model
+
+
+dataset_path = "/resized_mosaic_dataset.zip" #resized dataset (256x256)
+
+# Open the zip file
+with zipfile.ZipFile(dataset_path, 'r') as zip_ref:
+    
+    
+    image_files = [file for file in zip_ref.namelist() if file.lower().endswith((".jpg", ".png", ".jpeg"))] 
+    
+    # Preprocess images and compute NDVI/NDWI
+    processed_images = []
+    ndvi_images = []
+    ndwi_images = []
+
+    for img_path in image_files:
+        # Read image data from the zip file
+        with zip_ref.open(img_path) as img_file:
+            image = cv2.imdecode(np.frombuffer(img_file.read(), np.uint8), cv2.IMREAD_COLOR)  
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (256, 256))  # Standardize size
+        image = image.astype("float32") / 255.0  # Normalize
+
+        
+        nir = image[:, :, 0]  
+        green = image[:, :, 1]
+        blue = image[:, :, 2]
+
+        ndvi = (nir - blue) / (nir + blue + 1e-5)  
+        ndwi = (green - nir) / (green + nir + 1e-5)
+
+       
+        # Reshape NDVI and NDWI to have the same shape as the image
+        ndvi = ndvi.reshape(image.shape[0], image.shape[1], 1)  
+        ndwi = ndwi.reshape(image.shape[0], image.shape[1], 1)  
+
+        # Concatenate along the channels axis (axis=2)
+        image_with_indices = np.concatenate([image, ndvi, ndwi], axis=2) 
+        
+        processed_images.append(image_with_indices)
+        ndvi_images.append(ndvi)
+        ndwi_images.append(ndwi)
+
+# Convert list to numpy array
+processed_images = np.array(processed_images)
+
+# Define Autoencoder Model
+input_img = Input(shape=(256, 256, 5))  # 5 channels (RGB + NDVI + NDWI)
+
+# Encoder
+x = Conv2D(32, (3, 3), activation='relu', padding='same')(input_img)
+x = MaxPooling2D((2, 2), padding='same')(x)
+x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+x = MaxPooling2D((2, 2), padding='same')(x)
+encoded = Conv2D(128, (3, 3), activation='relu', padding='same')(x)  # Latent Features
+
+# Decoder
+x = Conv2D(64, (3, 3), activation='relu', padding='same')(encoded)
+x = UpSampling2D((2, 2))(x)
+x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+x = UpSampling2D((2, 2))(x)
+decoded = Conv2D(5, (3, 3), activation='sigmoid', padding='same')(x)
+
+# Build and Compile Autoencoder
+autoencoder = Model(input_img, decoded)
+autoencoder.compile(optimizer='adam', loss='mse')
+
+# Train Autoencoder on Dataset
+autoencoder.fit(processed_images, processed_images, epochs=20, batch_size=4, verbose=1)
+
+# Extract Latent Features for Each Image
+encoder = Model(input_img, encoded)
+latent_features = encoder.predict(processed_images)
+
+# Flatten Latent Features for Clustering
+latent_features_flat = latent_features.reshape(latent_features.shape[0], -1, latent_features.shape[-1])
+
+# Apply K-Means Clustering on Each Image
+segmented_images = []
+
+for i in range(len(image_files)):
+    kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(latent_features_flat[i])
+    segmented_image = clusters.reshape(64, 64)  # Downsampled due to encoding
+    segmented_image_resized = cv2.resize(segmented_image, (256, 256), interpolation=cv2.INTER_NEAREST)
+    segmented_images.append(segmented_image_resized)
+
+# Display Results
+fig, ax = plt.subplots(len(image_files), 3, figsize=(12, 5 * len(image_files)))
+
+for i in range(len(image_files)):
+    ax[i, 0].imshow(processed_images[i][:, :, :3])  # Original RGB
+    ax[i, 0].set_title("Original Image")
+
+    ax[i, 1].imshow(ndvi_images[i], cmap='Greens')
+    ax[i, 1].set_title("NDVI (Vegetation)")
+
+    ax[i, 2].imshow(segmented_images[i], cmap='jet')
+    ax[i, 2].set_title("Segmented Image")
+
+plt.show()
